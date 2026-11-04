@@ -1,0 +1,101 @@
+diff --git a/src/isa/riscv64/include/isa-all-instr.h b/src/isa/riscv64/include/isa-all-instr.h
+index ba29c820..c8c55afd 100644
+--- a/src/isa/riscv64/include/isa-all-instr.h
++++ b/src/isa/riscv64/include/isa-all-instr.h
+@@ -101,6 +101,7 @@
+ 
+ #ifdef CONFIG_RVV
+ #define VECTOR_INSTR_TERNARY(f) \
++  f(cie_vdot)\
+   f(vadd) f(vsub) f(vrsub) f(vminu) f(vmin) \
+   f(vmaxu) f(vmax) f(vand) f(vor) f(vxor) \
+   f(vrgather) f(vrgatherei16) \
+diff --git a/src/isa/riscv64/instr/rvv/decode.h b/src/isa/riscv64/instr/rvv/decode.h
+index 421479e9..99c6d8d0 100644
+--- a/src/isa/riscv64/instr/rvv/decode.h
++++ b/src/isa/riscv64/instr/rvv/decode.h
+@@ -332,6 +332,7 @@ def_THelper(vopmvv) {
+   if (!vp_enable()) {
+     return EXEC_ID_inv;
+   }
++  def_INSTR_TAB("001110 ? ????? ????? ??? ????? ????? ??", cie_vdot);
+   def_INSTR_TAB("000000 ? ????? ????? ??? ????? ????? ??", vredsum);
+   def_INSTR_TAB("000001 ? ????? ????? ??? ????? ????? ??", vredand);
+   def_INSTR_TAB("000010 ? ????? ????? ??? ????? ????? ??", vredor);
+@@ -537,7 +538,7 @@ def_THelper(vopfvf) {
+   def_INSTR_TAB("111101 ? ????? ????? ??? ????? ????? ??", vfwnmacc);
+   def_INSTR_TAB("111110 ? ????? ????? ??? ????? ????? ??", vfwmsac);
+   def_INSTR_TAB("111111 ? ????? ????? ??? ????? ????? ??", vfwnmsac);
+-
++ 
+   return EXEC_ID_inv;
+ }
+ 
+diff --git a/src/isa/riscv64/instr/rvv/vcompute.h b/src/isa/riscv64/instr/rvv/vcompute.h
+index 65fedb75..9e0d367f 100644
+--- a/src/isa/riscv64/instr/rvv/vcompute.h
++++ b/src/isa/riscv64/instr/rvv/vcompute.h
+@@ -18,6 +18,56 @@
+ 
+ #include "vcompute_impl.h"
+ #include "vcommon.h"
++def_EHelper(cie_vdot){
++  require_vector(true);;
++  
++  // 当前只支持：
++  // e8、m1、vl=8、vstart=0、无掩码、两个向量源。
++  if (vtype->vsew != 0 ||
++      vtype->vlmul != 0 ||
++      vl->val != 8 ||
++      vstart->val != 0 ||
++      s->vm != 1 ||
++      s->src_vmode != SRC_VV) {
++    longjmp_exception(EX_II);
++  }
++   // 每条指令从零开始累加，不使用旧目标寄存器的值。
++  int32_t vdot_sum = 0;
++
++  // 每轮分别保存两个源寄存器中取出的一个元素。
++  rtlreg_t src1 = 0;
++  rtlreg_t src2 = 0;
++
++  // 只计算低八个元素：下标 0～7。
++  for (int i = 0; i < 8; i++) {
++    // 第三个参数传入变量地址，让函数写入读取结果。
++    get_vreg(id_src->reg, i, &src1,
++             vtype->vsew, vtype->vlmul, SIGNED, 1);
++
++    get_vreg(id_src2->reg, i, &src2,
++             vtype->vsew, vtype->vlmul, SIGNED, 1);
++
++    // 按有符号 8 位解释输入。
++    // C 的整数提升保证乘积不会被截断成 8 位。
++    vdot_sum += (int8_t)src1 * (int8_t)src2;
++  }
++
++  // 全部源元素读取完成后，再修改目标寄存器。
++  // 宽度编码 2 表示 32 位；索引 0 对应 vd[31:0]。
++  // 接口会保留结果的低 32 位，因此这里直接传 vdot_sum。
++  set_vreg(id_dest->reg, 0, vdot_sum,
++           2, vtype->vlmul, 1);
++
++  // VLEN=128：其余三个 32 位块全部清零。
++  for (int part = 1; part < 4; part++) {
++    set_vreg(id_dest->reg, part, 0,
++             2, vtype->vlmul, 1);
++  }
++
++  // 成功完成后的向量状态更新。
++  vstart->val = 0;
++  vp_set_dirty();
++}
+ 
+ def_EHelper(vadd) {
+   ARITH(ADD, SIGNED)
+@@ -1355,4 +1405,4 @@ def_EHelper(vwsll) {
+   ARITH_WIDE(SLL, UNSIGNED)
+ }
+ 
+-#endif // CONFIG_RVV
+\ No newline at end of file
++#endif // CONFIG_RVV

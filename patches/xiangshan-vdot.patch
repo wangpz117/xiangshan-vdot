@@ -1,0 +1,108 @@
+diff --git a/src/main/scala/xiangshan/backend/decode/Instructions.scala b/src/main/scala/xiangshan/backend/decode/Instructions.scala
+index 0b2f535abb..787d3eae39 100644
+--- a/src/main/scala/xiangshan/backend/decode/Instructions.scala
++++ b/src/main/scala/xiangshan/backend/decode/Instructions.scala
+@@ -2,6 +2,10 @@ package xiangshan.backend.decode
+ 
+ import chisel3.util._
+ 
++object Xvdot {
++  def VDOT_VV = BitPat("b0011101??????????010?????1010111")
++}
++
+ object Zvbb {
+   def VANDN_VV = BitPat("b000001???????????000?????1010111")
+   def VANDN_VX = BitPat("b000001???????????100?????1010111")
+diff --git a/src/main/scala/xiangshan/backend/decode/VecDecoder.scala b/src/main/scala/xiangshan/backend/decode/VecDecoder.scala
+index 3764191079..a1085c6f48 100644
+--- a/src/main/scala/xiangshan/backend/decode/VecDecoder.scala
++++ b/src/main/scala/xiangshan/backend/decode/VecDecoder.scala
+@@ -12,6 +12,7 @@ import xiangshan.backend.fu.FuType
+ import xiangshan._
+ import yunsuan.{VfpuType, VipuType, VimacType, VpermType, VialuFixType, VfaluType, VfmaType, VfdivType, VfcvtType, VidivType}
+ import xiangshan.backend.decode.Zvbb._
++import xiangshan.backend.decode.Xvdot._
+ 
+ abstract class VecDecode extends XSDecodeBase {
+   def generate() : List[BitPat]
+@@ -368,6 +369,7 @@ object VecDecoder extends DecodeConstants {
+   )
+ 
+   val opmvv: Array[(BitPat, XSDecodeBase)] = Array(
++    VDOT_VV      -> OPMVV(F, FuType.vimac, VimacType.vdot, F, T, F, UopSplitType.VEC_VVV),
+     VAADD_VV     -> OPMVV(T, FuType.vialuF, VialuFixType.vaadd_vv, F, T, F, UopSplitType.VEC_VVV),
+     VAADDU_VV    -> OPMVV(T, FuType.vialuF, VialuFixType.vaaddu_vv, F, T, F, UopSplitType.VEC_VVV),
+     VASUB_VV     -> OPMVV(T, FuType.vialuF, VialuFixType.vasub_vv, F, T, F, UopSplitType.VEC_VVV),
+diff --git a/src/main/scala/xiangshan/backend/fu/wrapper/VIMacU.scala b/src/main/scala/xiangshan/backend/fu/wrapper/VIMacU.scala
+index 27eb8012e5..4a65835e75 100644
+--- a/src/main/scala/xiangshan/backend/fu/wrapper/VIMacU.scala
++++ b/src/main/scala/xiangshan/backend/fu/wrapper/VIMacU.scala
+@@ -5,7 +5,7 @@ import chisel3._
+ import chisel3.util._
+ import utility.XSError
+ import xiangshan.backend.fu.FuConfig
+-import xiangshan.backend.fu.vector.Bundles.VSew
++import xiangshan.backend.fu.vector.Bundles.{VLmul, VSew}
+ import xiangshan.backend.fu.vector.utils.VecDataSplitModule
+ import xiangshan.backend.fu.vector.{Mgu, Utils, VecPipedFuncUnit, VecSrcTypeModule}
+ import xiangshan.ExceptionNO
+@@ -55,6 +55,8 @@ class VIMacU(cfg: FuConfig)(implicit p: Parameters) extends VecPipedFuncUnit(cfg
+   private val format  = VimacType.getFormat(fuOpType)
+   private val widen   = format === VimacType.FMT.VVW
+   private val exchangeVs2Vd = VimacOpcode.overWriteMultiplicand(opcode)
++    // 输入端：当前送入功能单元的操作是否为自定义点积。
++  private val isVdot = fuOpType === VimacType.vdot
+ 
+   // modules
+   private val typeMod = Module(new VIMacSrcTypeModule)
+@@ -124,6 +126,26 @@ class VIMacU(cfg: FuConfig)(implicit p: Parameters) extends VecPipedFuncUnit(cfg
+     * [[mgu]]'s in connection
+     */
+   private val outVd = Cat(vimacs.reverse.map(_.io.vd))
++  // 输出端：使用与输出结果同步的操作类型，避免与后续输入指令混淆。
++  private val outIsVdot = outCtrl.fuOpType === VimacType.vdot
++  // 非加宽点积使用低 64 位输入；head 对应负责这部分输入的乘法模块。
++  // 从其完整结果中取出八份 16 位乘积，按补码有符号数解释，不截取为 8 位。
++  private val dotProducts = Seq.tabulate(8) { i =>
++    vimacs.head.io.fullProducts(16 * i + 15, 16 * i).asSInt
++  }
++  // 平衡加法树：8 份乘积 -> 4 份部分和 -> 2 份部分和 -> 1 份点积。
++  // 有符号 +& 每层保留额外一位，位宽依次为 16 -> 17 -> 18 -> 19。
++  private val dotSumL1 = Seq.tabulate(4) { i =>
++    dotProducts(2 * i) +& dotProducts(2 * i + 1)
++  }
++  private val dotSumL2 = Seq.tabulate(2) { i =>
++    dotSumL1(2 * i) +& dotSumL1(2 * i + 1)
++  }
++  private val dotSum = dotSumL2(0) +& dotSumL2(1)
++  // 先把有符号点积扩展到 32 位，再转换成补码位数据；其余目标位固定清零。
++  private val dotResult32 = dotSum.pad(32).asUInt
++  private val dotResult = Cat(0.U((dataWidth - 32).W), dotResult32)
++
+   private val outFormat = VimacType.getFormat(outCtrl.fuOpType)
+   private val outWiden = outFormat === VimacType.FMT.VVW
+   private val outVxsat = Cat(vimacs.reverse.map(_.io.vxsat))
+@@ -145,7 +167,20 @@ class VIMacU(cfg: FuConfig)(implicit p: Parameters) extends VecPipedFuncUnit(cfg
+   mgu.io.in.info.dstMask := 0.B
+   mgu.io.in.isIndexedVls := false.B
+ 
+-  io.out.bits.res.data := mgu.io.out.vd
+-  io.out.bits.res.vxsat.get := (outVxsat & mgu.io.out.active).orR
+-  io.out.bits.ctrl.exceptionVec.get(ExceptionNO.illegalInstr) := mgu.io.out.illegal
++  // 第一版点积仅支持 e8、m1、vl=8、vstart=0、无掩码；使用输出端对齐的配置。
++  private val dotConfigIllegal = outVecCtrl.vill ||
++    (outVecCtrl.vsew =/= VSew.e8) ||
++    (outVlmul =/= VLmul.m1) ||
++    (outVl =/= 8.U) ||
++    (outVstart =/= 0.U) ||
++    !outVm
++
++  // 点积使用完整的自定义结果格式；其他指令沿用原有掩码/尾部合并结果。
++  io.out.bits.res.data := Mux(outIsVdot, dotResult, mgu.io.out.vd)
++
++  // 点积保留完整结果，不发生饱和；原有指令的饱和标志逻辑保持不变。
++  io.out.bits.res.vxsat.get := Mux(outIsVdot, false.B, (outVxsat & mgu.io.out.active).orR)
++    // 点积检查自定义配置限制；其他指令保留原来的异常输出。
++  io.out.bits.ctrl.exceptionVec.get(ExceptionNO.illegalInstr) :=
++    Mux(outIsVdot, dotConfigIllegal, mgu.io.out.illegal)
+ }

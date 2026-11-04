@@ -1,0 +1,50 @@
+diff --git a/src/main/scala/yunsuan/encoding/Opcode/VimacOpcode.scala b/src/main/scala/yunsuan/encoding/Opcode/VimacOpcode.scala
+index d188aa4..2b544dc 100644
+--- a/src/main/scala/yunsuan/encoding/Opcode/VimacOpcode.scala
++++ b/src/main/scala/yunsuan/encoding/Opcode/VimacOpcode.scala
+@@ -11,6 +11,8 @@ object VimacOpcode {
+   def vmadd   = "b100".U(width.W)
+   def vnmsub  = "b101".U(width.W)
+   def vsmul   = "b110".U(width.W)
++    // 自定义有符号点积；在香山 VIMacU 中使用独立计算分支。
++  def vdot    = "b111".U(width.W)
+ 
+   def highHalf(opcode: UInt) = Seq(vmulh).map(_ === opcode).reduce(_ || _)
+ 
+diff --git a/src/main/scala/yunsuan/package.scala b/src/main/scala/yunsuan/package.scala
+index 069366b..a7dc073 100644
+--- a/src/main/scala/yunsuan/package.scala
++++ b/src/main/scala/yunsuan/package.scala
+@@ -397,6 +397,9 @@ package object yunsuan {
+     def vmadd              = LiteralCat(0.U(2.W), INT.S, INT.S, INT.S, FMT.VVV, VimacOpcode.vmadd)  // "b00_111_0_100".U(OpTypeWidth.W) // vmadd   vmadd.vv/vmadd.vx
+     def vnmsub             = LiteralCat(0.U(2.W), INT.S, INT.S, INT.S, FMT.VVV, VimacOpcode.vnmsub) // "b00_111_0_101".U(OpTypeWidth.W) // vnmsub  vnmsub.vv/vnmsub.vx
+     def vsmul              = LiteralCat(0.U(2.W), INT.S, INT.S, INT.X, FMT.VVV, VimacOpcode.vsmul)  // "b00_110_0_110".U(OpTypeWidth.W) // vsmul   vsmul.vv/vsmul.vx
++    // 自定义点积：两路源按有符号数解释，不累加旧 vd，使用非加宽格式标记。
++    // 低八个 int8 求点积、低 32 位写回及其余位清零，由 VIMacU 的独立分支实现。
++    def vdot               = LiteralCat(0.U(2.W), INT.S, INT.S, INT.X, FMT.VVV, VimacOpcode.vdot) // "b00_110_0_111".U(OpTypeWidth.W)
+ 
+     def getOpcode(fuOpType: UInt) : UInt = fuOpType(2, 0)
+     def getFormat(fuOpType: UInt) : UInt = fuOpType(3)
+diff --git a/src/main/scala/yunsuan/vector/vectorIMAC/VIMac64b.scala b/src/main/scala/yunsuan/vector/vectorIMAC/VIMac64b.scala
+index 16864ed..04a78ff 100644
+--- a/src/main/scala/yunsuan/vector/vectorIMAC/VIMac64b.scala
++++ b/src/main/scala/yunsuan/vector/vectorIMAC/VIMac64b.scala
+@@ -27,6 +27,9 @@ class VIMac64b extends Module {
+ 
+     val vd = Output(UInt(64.W))
+     val vxsat = Output(UInt(8.W))
++    // 引出截取前的乘法/乘加中间结果，与原有 vd 使用相同的流水线时刻。
++    // 点积配置下（有符号 e8、非乘加），包含八份完整的 16 位乘积，低索引在低位。
++    val fullProducts = Output(UInt(128.W))
+   })
+ 
+   val fire = io.fire
+@@ -206,6 +209,8 @@ class VIMac64b extends Module {
+    */
+   val walOut = Wire(UInt(128.W))
+   walOut := RegEnable(sum_wo.asUInt, fireS1)
++  // 仅增加连线，复用已有寄存器输出，不新增乘法器或流水级。
++  io.fullProducts := walOut
+   val sewS2 = RegEnable(sewS1, fireS1)
+   val highHalfS2 = RegEnable(highHalfS1, fireS1)
+   val widenS2 = RegEnable(widenS1, fireS1)
